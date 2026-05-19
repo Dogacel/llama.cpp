@@ -63,10 +63,15 @@ class LlamaModel(TextModel):
             with open(self.target_model_dir / "config.json", 'r', encoding='utf-8') as f:
                 target_config = json.load(f)
 
-            # extract_layers: derived from target model layer count (low/mid/high)
+            # extract_layers: prefer eagle3 config if it lists them explicitly, else derive from target layer count
             target_num_layers = target_config["num_hidden_layers"]
-            extract_layers = [2, target_num_layers // 2, target_num_layers - 3]
-            logger.info(f"EAGLE-3: extract_layers = {extract_layers} (target model has {target_num_layers} layers)")
+            cfg_extract = (eagle3_raw_config.get("eagle_config") or {}).get("eagle_aux_hidden_state_layer_ids")
+            if cfg_extract:
+                extract_layers = list(cfg_extract)
+                logger.info(f"EAGLE-3: extract_layers = {extract_layers} (from eagle3 config.eagle_config.eagle_aux_hidden_state_layer_ids)")
+            else:
+                extract_layers = [2, target_num_layers // 2, target_num_layers - 3]
+                logger.info(f"EAGLE-3: extract_layers = {extract_layers} (target model has {target_num_layers} layers)")
             self.gguf_writer.add_array(f"{self.gguf_writer.arch}.extract_layers", extract_layers)
 
             # target_hidden_size: prefer eagle3 config, fallback to target config
@@ -83,6 +88,16 @@ class LlamaModel(TextModel):
             norm_before_residual = eagle3_raw_config.get("norm_before_residual", False)
             logger.info(f"EAGLE-3: norm_before_residual = {norm_before_residual}")
             self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.norm_before_residual", norm_before_residual)
+
+            # fc_norm: per-aux-layer RMSNorm applied before the fc fusion projection
+            fc_norm = bool(eagle3_raw_config.get("fc_norm", False))
+            logger.info(f"EAGLE-3: fc_norm = {fc_norm}")
+            self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fc_norm", fc_norm)
+
+            # norm_output: target captures hidden states *after* drafter's final RMSNorm
+            norm_output = bool(eagle3_raw_config.get("norm_output", False))
+            logger.info(f"EAGLE-3: norm_output = {norm_output}")
+            self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.norm_output", norm_output)
 
     def set_vocab(self):
         # eagle3: use tokenizer from target model if provided
@@ -225,6 +240,9 @@ class LlamaModel(TextModel):
                 return
             if name == "model.layers.0.hidden_norm.weight":
                 yield ("blk.0.hidden_norm.weight", data_torch)
+                return
+            if name.startswith("fc_norm.") and name.endswith(".weight"):
+                yield (name, data_torch)
                 return
 
         n_head = self.find_hparam(["n_heads", "num_attention_heads"])
